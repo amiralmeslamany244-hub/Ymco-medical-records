@@ -25819,16 +25819,28 @@ window.toggleInjuryPrintPreview = function(){
 
   function openAuditorView(unit){
     const m = ensureAuditorModal();
-    // FIX: fetch the public summary first so the "inspected today" banner is
-    // accurate for records created on another device / by another user.
-    try { if (typeof __clFetchPublic === 'function') __clFetchPublic(unit.barcode).then(()=>{ try { openAuditorView.__rerender && openAuditorView.__rerender(unit); } catch(_){} }); } catch(_){}
+    // FIX (anti-flash): don't paint the red "Not inspected today" banner until
+    // the public summary fetch resolves. If the local cache already shows
+    // today's inspection, we can paint the green banner immediately; otherwise
+    // we show a neutral "Checking…" state until the async read completes so
+    // the banner never flips from red → green in front of the user.
+    const __alreadyKnownToday = (function(){
+      try { return __clAlreadyInspectedToday(unit); } catch(_) { return false; }
+    })();
+    const __pubCachedNow = (typeof __clPublicGet === 'function') ? __clPublicGet(unit.barcode) : null;
+    let __bannerResolved = __alreadyKnownToday || !!__pubCachedNow;
+    try {
+      if (typeof __clFetchPublic === 'function') {
+        __clFetchPublic(unit.barcode).then(()=>{
+          __bannerResolved = true;
+          try { openAuditorView.__rerender && openAuditorView.__rerender(unit); } catch(_){}
+        });
+      }
+    } catch(_){}
     document.getElementById('clAuditorTitle').innerHTML =
       `<i class="fas ${unit.icon||'fa-cube'}" style="color:${unit.color||'#0284c7'};"></i> Auditor · ${_escHtml(unit.name)} <span style="opacity:.6;font-weight:400;font-size:.85rem;">(${_escHtml(unit.barcode)})</span>`;
     const recs = loadRecs().filter(r => r && (r.unitId === unit.id || (r.barcode && unit.barcode && String(r.barcode).toLowerCase() === String(unit.barcode).toLowerCase())));
     const today = Date.now();
-    // FIX: reusable banner builder — re-reads the freshest local recs and
-    // public cache every time so a late-arriving Firebase read can flip the
-    // banner from "Not inspected today" → "Inspected today".
     function __buildAuditorBannerHtml(){
       const freshRecs = loadRecs().filter(r => r && (r.unitId === unit.id || (r.barcode && unit.barcode && String(r.barcode).toLowerCase() === String(unit.barcode).toLowerCase())));
       const pubSum2 = (typeof __clPublicGet === 'function') ? __clPublicGet(unit.barcode) : null;
@@ -25840,6 +25852,12 @@ window.toggleInjuryPrintPreview = function(){
         lastRec2 = { ts: pubTs2, specialistNurse: (pubSum2 && pubSum2.specialistNurse)||'', allPassed: (pubSum2 && pubSum2.status==='pass'), unitId: unit.id, barcode: unit.barcode };
       }
       const nurse = (localToday && localToday.specialistNurse) || (pubSum2 && pubSum2.specialistNurse) || '';
+      // While the async public read is still in flight AND we have no positive
+      // local signal, show a neutral "Checking…" banner instead of flashing
+      // red then flipping green.
+      if (!__bannerResolved && !inspectedToday2) {
+        return `<div role="status" aria-live="polite" style="padding:18px 20px;background:linear-gradient(135deg,#64748b,#475569);color:#ffffff;border:3px solid #334155;border-radius:14px;font-weight:800;font-size:20px;line-height:1.35;letter-spacing:.3px;text-align:center;margin-bottom:14px;box-shadow:0 6px 18px rgba(71,85,105,.3);text-shadow:0 1px 2px rgba(0,0,0,.25);"><i class="fas fa-circle-notch fa-spin" style="font-size:22px;margin-inline-end:8px;"></i> Checking today's inspection — جارٍ التحقق من فحص اليوم…</div>`;
+      }
       return inspectedToday2
         ? `<div role="status" aria-live="polite" style="padding:18px 20px;background:linear-gradient(135deg,#16a34a,#15803d);color:#ffffff;border:3px solid #14532d;border-radius:14px;font-weight:900;font-size:22px;line-height:1.35;letter-spacing:.3px;text-align:center;margin-bottom:14px;box-shadow:0 6px 18px rgba(22,163,74,.35);text-shadow:0 1px 2px rgba(0,0,0,.25);"><i class="fas fa-check-circle" style="font-size:26px;margin-inline-end:8px;"></i> Inspected today — تم الفحص اليوم${lastRec2?`<div style="font-size:14px;font-weight:600;opacity:.95;margin-top:6px;">${_escHtml(_fmtDT(lastRec2.ts))}${nurse?' · '+_escHtml(nurse):''}</div>`:''}</div>`
         : `<div role="alert" aria-live="assertive" style="padding:18px 20px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#ffffff;border:3px solid #7f1d1d;border-radius:14px;font-weight:900;font-size:22px;line-height:1.35;letter-spacing:.3px;text-align:center;margin-bottom:14px;box-shadow:0 6px 18px rgba(220,38,38,.4);text-shadow:0 1px 2px rgba(0,0,0,.3);"><i class="fas fa-exclamation-triangle" style="font-size:26px;margin-inline-end:8px;"></i> Not inspected today — لم يتم الفحص اليوم</div>`;
@@ -25851,6 +25869,7 @@ window.toggleInjuryPrintPreview = function(){
       lastRec = { ts: pubTs, specialistNurse: pubSum.specialistNurse||'', allPassed: (pubSum.status==='pass'), unitId: unit.id, barcode: unit.barcode };
     }
     const banner = __buildAuditorBannerHtml();
+
     const itemsHtml = (unit.items||[]).map((it,i)=>`<li style="padding:6px 0;border-bottom:1px dashed #e2e8f0;">${i+1}. ${_escHtml(it)}</li>`).join('') || '<li style="color:#94a3b8;">No items defined</li>';
     // PERF: cap to 20 rows; long histories with embedded data were the main slowness.
     const rowsHtml = recs.length
