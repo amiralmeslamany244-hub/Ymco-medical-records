@@ -24730,10 +24730,55 @@ window.toggleInjuryPrintPreview = function(){
       throw e;
     }
   }
+  // Normalize a unit's items field into a clean, ordered string[].
+  // Handles arrays, Firebase-decoded objects with numeric keys, sparse keys,
+  // and honors an explicit itemsOrder hint written by saveChecklistManage.
+  function _clNormalizeItems(raw, orderHint){
+    let arr = [];
+    if (Array.isArray(raw)) {
+      arr = raw;
+    } else if (raw && typeof raw === 'object') {
+      const keys = Object.keys(raw).sort((a,b)=>{
+        const na = Number(a), nb = Number(b);
+        const aNum = Number.isFinite(na), bNum = Number.isFinite(nb);
+        if (aNum && bNum) return na - nb;
+        if (aNum) return -1;
+        if (bNum) return 1;
+        return a.localeCompare(b);
+      });
+      arr = keys.map(k => raw[k]);
+    }
+    const clean = arr
+      .map(v => (v == null ? '' : String(v)))
+      .map(s => s.trim())
+      .filter(Boolean);
+    // If a canonical order hint exists and matches (case-insensitive set),
+    // use it as the authoritative order.
+    if (Array.isArray(orderHint) && orderHint.length) {
+      const hint = orderHint.map(v => String(v == null ? '' : v).trim()).filter(Boolean);
+      const setA = new Set(clean.map(x => x.toLowerCase()));
+      const setB = new Set(hint.map(x => x.toLowerCase()));
+      if (setA.size === setB.size) {
+        let same = true;
+        setA.forEach(k => { if (!setB.has(k)) same = false; });
+        if (same) return hint;
+      }
+    }
+    return clean;
+  }
+  function _clNormalizeUnitsList(list){
+    if (!Array.isArray(list)) return list;
+    return list.map(u => {
+      if (!u || typeof u !== 'object') return u;
+      const items = _clNormalizeItems(u.items, u.itemsOrder);
+      return Object.assign({}, u, { items: items, itemsOrder: items.slice() });
+    });
+  }
   function fbPushUnits(list){
     if (fbSuppress) return;
-    if (!fbReady || !fbUser()) { pendingUnits = list; queueWaitingToast(); return; }
-    fbSetWithFallback(FB_UNITS_PATH, list, 'units').catch(()=>{});
+    const clean = _clNormalizeUnitsList(list);
+    if (!fbReady || !fbUser()) { pendingUnits = clean; queueWaitingToast(); return; }
+    fbSetWithFallback(FB_UNITS_PATH, clean, 'units').catch(()=>{});
   }
   function fbPushRecs(list){
     if (fbSuppress) return;
@@ -25024,6 +25069,9 @@ window.toggleInjuryPrintPreview = function(){
         try { fbPushUnits(list); } catch(_){}
         console.info('[checklist-sync] merged '+missingDefaults.length+' new default checklist(s) into remote list');
       }
+      // Normalize items on read so item order is stable regardless of how
+      // Firebase serialized the array (array vs object with numeric keys).
+      list = _clNormalizeUnitsList(list);
       fbSuppress = true;
       __unitsCache = list.slice();
       __clUnitsReady = true;
@@ -26046,7 +26094,37 @@ window.toggleInjuryPrintPreview = function(){
     }
     const banner = __buildAuditorBannerHtml();
 
-    const itemsHtml = (unit.items||[]).map((it,i)=>`<li style="padding:6px 0;border-bottom:1px dashed #e2e8f0;">${i+1}. ${_escHtml(it)}</li>`).join('') || '<li style="color:#94a3b8;">No items defined</li>';
+    // Filter (dedupe, non-empty) while preserving insertion order (chronological add order).
+    const __rawItems = Array.isArray(unit.items) ? unit.items : [];
+    const __meta = (unit.itemsMeta && typeof unit.itemsMeta === 'object') ? unit.itemsMeta : {};
+    const __seenItems = new Set();
+    const __itemsList = [];
+    __rawItems.forEach(it => {
+      const name = String(it||'').trim();
+      if (!name) return;
+      const k = name.toLowerCase();
+      if (__seenItems.has(k)) return;
+      __seenItems.add(k);
+      __itemsList.push({ name, addedAt: Number(__meta[k]) || 0 });
+    });
+    // Sort: preserve insertion order (chronological). Items without a timestamp keep their
+    // original position; timestamped items respect their addedAt ascending.
+    // Since insertion order already reflects add order, we do not resort — this keeps
+    // legacy items stable and new items appended at the end.
+    const __itemsUpdatedAt = Number(unit.itemsUpdatedAt) || 0;
+    const __recentThreshold = __itemsUpdatedAt ? (__itemsUpdatedAt - 1) : 0;
+    const itemsHtml = __itemsList.length
+      ? __itemsList.map((row, i) => {
+          const isNew = __recentThreshold && row.addedAt && row.addedAt >= __recentThreshold;
+          const badge = isNew
+            ? ' <span style="background:#dcfce7;color:#166534;padding:1px 8px;border-radius:999px;font-size:.7rem;font-weight:700;margin-inline-start:6px;">New · جديد</span>'
+            : '';
+          return `<li style="padding:6px 0;border-bottom:1px dashed #e2e8f0;">${i+1}. ${_escHtml(row.name)}${badge}</li>`;
+        }).join('')
+      : '<li style="color:#94a3b8;">No items defined</li>';
+    const __itemsHeaderMeta = __itemsUpdatedAt
+      ? `<div style="font-size:.72rem;color:#64748b;font-weight:600;margin-bottom:6px;"><i class="far fa-clock"></i> Form last updated · آخر تحديث للاستمارة: ${_escHtml(_fmtDT(__itemsUpdatedAt))} · ${__itemsList.length} items</div>`
+      : `<div style="font-size:.72rem;color:#64748b;font-weight:600;margin-bottom:6px;">${__itemsList.length} items</div>`;
     // PERF: cap to 20 rows; long histories with embedded data were the main slowness.
     const rowsHtml = recs.length
       ? recs.slice(0,20).map(r=>{
@@ -26117,7 +26195,8 @@ window.toggleInjuryPrintPreview = function(){
       <div id="clAuditorBanner">${banner}</div>
       <div style="display:grid;grid-template-columns:1fr;gap:16px;">
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
-          <div style="font-weight:700;color:#0f172a;margin-bottom:8px;"><i class="fas fa-list-check"></i> Checklist items — بنود الفحص</div>
+          <div style="font-weight:700;color:#0f172a;margin-bottom:4px;"><i class="fas fa-list-check"></i> Checklist items — بنود الفحص</div>
+          ${__itemsHeaderMeta}
           <ul style="margin:0;padding-left:18px;color:#334155;font-size:.92rem;">${itemsHtml}</ul>
         </div>
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;">
@@ -26228,12 +26307,32 @@ window.toggleInjuryPrintPreview = function(){
   window.saveChecklistManage = function(){
     if (!__clRequireReady()) return;
     if (!manageUnitId) return;
-    const cleaned = manageDraft.map(s=>String(s||'').trim()).filter(Boolean);
+    const rawCleaned = manageDraft.map(s=>String(s||'').trim()).filter(Boolean);
+    // Dedupe (case-insensitive) while preserving insertion order.
+    const _seen = new Set();
+    const cleaned = [];
+    for (const it of rawCleaned) {
+      const k = it.toLowerCase();
+      if (_seen.has(k)) continue;
+      _seen.add(k);
+      cleaned.push(it);
+    }
     if (!cleaned.length){ alert('At least one item is required'); return; }
     const units = loadUnits();
     const u = units.find(x=>x.id===manageUnitId);
     if (!u) return;
+    // Track per-item added-at so we preserve order and can flag newly added items.
+    const now = Date.now();
+    const prevMeta = (u.itemsMeta && typeof u.itemsMeta === 'object') ? u.itemsMeta : {};
+    const nextMeta = {};
+    cleaned.forEach(name => {
+      const k = name.toLowerCase();
+      nextMeta[k] = prevMeta[k] || now;
+    });
     u.items = cleaned;
+    u.itemsOrder = cleaned.slice(); // explicit canonical order, survives Firebase array->object serialization
+    u.itemsMeta = nextMeta;
+    u.itemsUpdatedAt = now;
     saveUnits(units);
     closeChecklistManage();
     renderHub();
