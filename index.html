@@ -25767,9 +25767,9 @@ window.toggleInjuryPrintPreview = function(){
     if (m) return m;
     m = document.createElement('div');
     m.id = 'clRoleChoiceModal';
-    m.style.cssText = 'position:fixed;inset:0;background:#0f172acc;z-index:1000010;display:none;align-items:center;justify-content:center;padding:20px;filter:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;opacity:1!important;transform:none!important;';
+    m.style.cssText = 'position:fixed;inset:0;background:#0f172acc;z-index:1000010;display:none;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto;-webkit-overflow-scrolling:touch;filter:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;opacity:1!important;transform:none!important;';
     m.innerHTML = `
-      <div style="background:#fff;border-radius:16px;max-width:520px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.35);filter:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;opacity:1!important;transform:none!important;">
+      <div style="background:#fff;border-radius:16px;max-width:520px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.35);margin:20px 0 40px;max-height:calc(100vh - 60px);overflow-y:auto;-webkit-overflow-scrolling:touch;filter:none!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;opacity:1!important;transform:none!important;">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
           <h2 style="margin:0;font-size:1.15rem;color:#0f172a;"><i class="fas fa-user-shield"></i> Select Role — اختر الصلاحية</h2>
           <button type="button" onclick="closeChecklistRoleChoice()" style="background:#f1f5f9;border:none;width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:16px;color:#475569;">&times;</button>
@@ -25821,9 +25821,11 @@ window.toggleInjuryPrintPreview = function(){
       openAuditorView(unit);
     }
   }
-  function __clBuildHistoryBlockHtml(unit){
+  function __clBuildHistoryBlockHtml(unit, opts){
+    opts = opts || {};
+    const bc = unit && unit.barcode ? String(unit.barcode).toLowerCase() : '';
     const recs = loadRecs()
-      .filter(r => r && (r.unitId === unit.id || (r.barcode && unit.barcode && String(r.barcode).toLowerCase() === String(unit.barcode).toLowerCase())))
+      .filter(r => r && (r.unitId === unit.id || (r.barcode && bc && String(r.barcode).toLowerCase() === bc)))
       .sort((a,b)=>(b.ts||0)-(a.ts||0));
     const pub = (typeof __clPublicGet === 'function') ? __clPublicGet(unit.barcode) : null;
     let rows = recs.slice(0,10).map(r=>{
@@ -25841,19 +25843,26 @@ window.toggleInjuryPrintPreview = function(){
         <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;">${badge}</td>
       </tr>`;
     });
-    if (!rows.length && pub && Number(pub.lastTs)) {
+    // Always append public summary as a distinct row when we have one and it isn't
+    // already represented in local recs (compares by timestamp).
+    if (pub && Number(pub.lastTs) && !recs.some(r => Number(r.ts) === Number(pub.lastTs))) {
       const items = pub.items || [];
       const passed = items.filter(x=>x&&x.ok).length;
-      const badge = (pub.status==='pass')
+      const anyUnchecked = items.some(x=>x && x.checked===false);
+      const ok = (pub.status==='pass') && !anyUnchecked;
+      const badge = ok
         ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Pass</span>'
         : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Issues</span>';
-      rows = [`<tr>
-        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(_fmtDT(pub.lastTs))}</td>
+      rows.unshift(`<tr style="background:#f1f5f9;">
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(_fmtDT(pub.lastTs))} <span style="opacity:.6;font-size:.68rem;">(cloud)</span></td>
         <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(pub.specialistNurse||'—')}</td>
         <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;font-size:.8rem;">${passed}/${items.length}</td>
         <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;">${badge}</td>
-      </tr>`];
+      </tr>`);
     }
+    const loadingNote = opts.loading
+      ? `<div style="padding:8px;text-align:center;color:#64748b;font-size:.75rem;"><i class="fas fa-spinner fa-spin"></i> Loading cloud history… جارٍ تحميل السجل</div>`
+      : '';
     const body = rows.length
       ? `<div style="overflow-x:auto;max-height:220px;overflow-y:auto;">
            <table style="width:100%;border-collapse:collapse;">
@@ -25865,10 +25874,12 @@ window.toggleInjuryPrintPreview = function(){
              </tr></thead>
              <tbody>${rows.join('')}</tbody>
            </table>
-         </div>`
-      : `<div style="padding:12px;text-align:center;color:#94a3b8;font-size:.85rem;">No previous inspections yet · لا توجد فحوصات سابقة</div>`;
+         </div>${loadingNote}`
+      : (opts.loading
+          ? loadingNote
+          : `<div style="padding:12px;text-align:center;color:#94a3b8;font-size:.85rem;">No previous inspections yet · لا توجد فحوصات سابقة</div>`);
     return `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap;">
         <div style="font-weight:700;color:#0f172a;font-size:.85rem;"><i class="fas fa-history"></i> Previous inspections — سجل الفحوصات السابقة</div>
         <button type="button" onclick="(function(){try{closeChecklistRoleChoice();openAuditorView(${JSON.stringify(unit).replace(/</g,'\\u003c')});}catch(e){}})()" style="background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;padding:4px 10px;border-radius:6px;cursor:pointer;font-weight:600;font-size:.72rem;"><i class="fas fa-external-link-alt"></i> View full</button>
       </div>
@@ -25892,14 +25903,19 @@ window.toggleInjuryPrintPreview = function(){
     // Inject previous-inspections block for this unit.
     try {
       const hb = document.getElementById('clRoleHistoryBlock');
-      if (hb) hb.innerHTML = __clBuildHistoryBlockHtml(unit);
+      if (hb) hb.innerHTML = __clBuildHistoryBlockHtml(unit, { loading: true });
       // Refresh from public summary so cross-device history shows up.
       if (typeof __clFetchPublic === 'function') {
         __clFetchPublic(unit.barcode).then(()=>{
           const hb2 = document.getElementById('clRoleHistoryBlock');
           const stillOpen = document.getElementById('clRoleChoiceModal')?.style.display === 'flex';
-          if (hb2 && stillOpen) hb2.innerHTML = __clBuildHistoryBlockHtml(unit);
-        }).catch(()=>{});
+          if (hb2 && stillOpen) hb2.innerHTML = __clBuildHistoryBlockHtml(unit, { loading: false });
+        }).catch(()=>{
+          const hb3 = document.getElementById('clRoleHistoryBlock');
+          if (hb3) hb3.innerHTML = __clBuildHistoryBlockHtml(unit, { loading: false });
+        });
+      } else if (hb) {
+        hb.innerHTML = __clBuildHistoryBlockHtml(unit, { loading: false });
       }
     } catch(_){}
     const insBtn = document.getElementById('clRoleInspectorBtn');
