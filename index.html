@@ -24501,11 +24501,20 @@ window.toggleInjuryPrintPreview = function(){
 
 <script>
 (function(){
-  // ==== Firebase-only storage (localStorage removed for checklists) ====
-  // Legacy keys kept ONLY to purge any old data from users' devices on load.
-  const LEGACY_KEYS = ['ymco_checklist_units_v2','ymco_checklist_inspections_v1',
-                       'ymco_checklist_deleted_v1','ymco_last_specialist_nurse'];
-  try { LEGACY_KEYS.forEach(k => { try { localStorage.removeItem(k); } catch(_){} }); } catch(_){}
+  // ==== Firebase-first storage for checklists ====
+  // Keep old browser data long enough to migrate/backfill it to Firebase; do NOT
+  // purge it on load or older inspection history disappears before it can sync.
+  function __clReadLegacyJson(key, fallback){
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      return parsed == null ? fallback : parsed;
+    } catch(_){ return fallback; }
+  }
+  const __legacyUnitsSnapshot = __clReadLegacyJson('ymco_checklist_units_v2', null);
+  const __legacyRecsSnapshot  = __clReadLegacyJson('ymco_checklist_inspections_v1', null);
+  try { localStorage.removeItem('ymco_last_specialist_nurse'); } catch(_){}
   // Session-only last-used nurse name (no persistence).
   if (typeof window.__ymcoLastNurse !== 'string') window.__ymcoLastNurse = '';
   // Readiness gate: block checklist UI until Firebase RTDB delivers at least
@@ -24573,15 +24582,62 @@ window.toggleInjuryPrintPreview = function(){
   // (all write-actions are blocked by __clRequireReady before that).
   let __unitsCache = null;
   window.__invalidateUnitsCache = function(){ /* no-op: Firebase snapshots repopulate */ };
+  function __clNormalizeList(raw){
+    if (Array.isArray(raw)) return raw.filter(v => v != null);
+    if (raw && typeof raw === 'object') {
+      return Object.keys(raw)
+        .sort((a,b)=>{
+          const na = Number(a), nb = Number(b);
+          if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+          if (Number.isFinite(na)) return -1;
+          if (Number.isFinite(nb)) return 1;
+          return String(a).localeCompare(String(b));
+        })
+        .map(k => raw[k])
+        .filter(v => v != null);
+    }
+    return [];
+  }
+  function _clNormalizeItems(raw, orderHint){
+    const base = __clNormalizeList(raw).map(v => {
+      if (v && typeof v === 'object') return String(v.name || v.item || v.title || '').trim();
+      return String(v == null ? '' : v).trim();
+    }).filter(Boolean);
+    const byName = new Map();
+    base.forEach(v => { const k = v.toLowerCase(); if (!byName.has(k)) byName.set(k, v); });
+    const ordered = [];
+    const used = new Set();
+    __clNormalizeList(orderHint).forEach(v => {
+      const k = String(v == null ? '' : v).trim().toLowerCase();
+      if (!k || used.has(k) || !byName.has(k)) return;
+      used.add(k);
+      ordered.push(byName.get(k));
+    });
+    base.forEach(v => { const k = v.toLowerCase(); if (!used.has(k)) { used.add(k); ordered.push(v); } });
+    return ordered;
+  }
+  function _clNormalizeUnit(u){
+    if (!u || typeof u !== 'object') return null;
+    const out = Object.assign({}, u);
+    out.items = _clNormalizeItems(out.items, out.itemsOrder);
+    out.itemsOrder = out.items.slice();
+    return out;
+  }
+  function _clNormalizeUnitsList(raw){
+    return __clNormalizeList(raw).map(_clNormalizeUnit).filter(Boolean);
+  }
   function loadUnits(){
     if (__unitsCache && Array.isArray(__unitsCache)) return __unitsCache;
-    return JSON.parse(JSON.stringify(DEFAULT_UNITS));
+    const legacy = _clNormalizeUnitsList(__legacyUnitsSnapshot);
+    if (legacy.length) return legacy;
+    return _clNormalizeUnitsList(JSON.parse(JSON.stringify(DEFAULT_UNITS)));
   }
   function saveUnits(list){
     // Update in-memory cache immediately for UI responsiveness; the Firebase
     // listener will overwrite it with the authoritative snapshot after write.
-    __unitsCache = Array.isArray(list) ? list.slice() : list;
-    fbPushUnits(list);
+    const clean = _clNormalizeUnitsList(list);
+    __unitsCache = clean.slice();
+    fbPushUnits(clean);
   }
   function normalizeBarcode(v){ return String(v == null ? '' : v).trim().toLowerCase(); }
   function currentUnitMaps(){
@@ -24607,14 +24663,27 @@ window.toggleInjuryPrintPreview = function(){
     // A record with a barcode must belong to the same current checklist barcode.
     // This is the main guard against one checklist borrowing another checklist's inspection.
     if (expectedBc && bc && bc !== expectedBc) return null;
+    const cleanItems = __clNormalizeList(r.items).map(it => {
+      if (it && typeof it === 'object') {
+        return {
+          name: String(it.name || it.item || it.title || '').trim(),
+          ok: !!it.ok,
+          checked: !!(it.checked || it.ok || (it.ok === false && it.checked)),
+          notes: String(it.notes || it.note || '').trim()
+        };
+      }
+      const name = String(it == null ? '' : it).trim();
+      return name ? { name, ok:false, checked:false, notes:'' } : null;
+    }).filter(it => it && it.name);
     return Object.assign({}, r, {
       unitId: unit.id,
       unitName: r.unitName || unit.name,
-      barcode: r.barcode || unit.barcode
+      barcode: r.barcode || unit.barcode,
+      items: cleanItems
     });
   }
   function sanitizeInspectionList(list){
-    const arr = Array.isArray(list) ? list : [];
+    const arr = __clNormalizeList(list);
     const maps = currentUnitMaps();
     const out = [];
     const seen = new Set();
@@ -24631,7 +24700,7 @@ window.toggleInjuryPrintPreview = function(){
   window.__invalidateRecsCache = function(){ /* no-op: Firebase snapshots repopulate */ };
   function loadRecs(){
     if (__recsCache && Array.isArray(__recsCache)) return __recsCache;
-    return [];
+    return sanitizeInspectionList(__legacyRecsSnapshot);
   }
   function saveRecs(list){
     __recsCache = sanitizeInspectionList(list);
@@ -24730,50 +24799,6 @@ window.toggleInjuryPrintPreview = function(){
       throw e;
     }
   }
-  // Normalize a unit's items field into a clean, ordered string[].
-  // Handles arrays, Firebase-decoded objects with numeric keys, sparse keys,
-  // and honors an explicit itemsOrder hint written by saveChecklistManage.
-  function _clNormalizeItems(raw, orderHint){
-    let arr = [];
-    if (Array.isArray(raw)) {
-      arr = raw;
-    } else if (raw && typeof raw === 'object') {
-      const keys = Object.keys(raw).sort((a,b)=>{
-        const na = Number(a), nb = Number(b);
-        const aNum = Number.isFinite(na), bNum = Number.isFinite(nb);
-        if (aNum && bNum) return na - nb;
-        if (aNum) return -1;
-        if (bNum) return 1;
-        return a.localeCompare(b);
-      });
-      arr = keys.map(k => raw[k]);
-    }
-    const clean = arr
-      .map(v => (v == null ? '' : String(v)))
-      .map(s => s.trim())
-      .filter(Boolean);
-    // If a canonical order hint exists and matches (case-insensitive set),
-    // use it as the authoritative order.
-    if (Array.isArray(orderHint) && orderHint.length) {
-      const hint = orderHint.map(v => String(v == null ? '' : v).trim()).filter(Boolean);
-      const setA = new Set(clean.map(x => x.toLowerCase()));
-      const setB = new Set(hint.map(x => x.toLowerCase()));
-      if (setA.size === setB.size) {
-        let same = true;
-        setA.forEach(k => { if (!setB.has(k)) same = false; });
-        if (same) return hint;
-      }
-    }
-    return clean;
-  }
-  function _clNormalizeUnitsList(list){
-    if (!Array.isArray(list)) return list;
-    return list.map(u => {
-      if (!u || typeof u !== 'object') return u;
-      const items = _clNormalizeItems(u.items, u.itemsOrder);
-      return Object.assign({}, u, { items: items, itemsOrder: items.slice() });
-    });
-  }
   function fbPushUnits(list){
     if (fbSuppress) return;
     const clean = _clNormalizeUnitsList(list);
@@ -24828,12 +24853,12 @@ window.toggleInjuryPrintPreview = function(){
     if (fbSuppress || !rec || !rec.barcode) return;
     const key = encodeFbKey(rec.barcode);
     if (!key) return;
-    const safeItems = Array.isArray(rec.items) ? rec.items.map(it => ({
+    const safeItems = __clNormalizeList(rec.items).map(it => ({
       name:    String((it && it.name) || ''),
       ok:      !!(it && it.ok),
       checked: !!(it && (it.checked || it.ok || it.ok === false && it.checked)),
       notes:   String((it && it.notes) || '')
-    })) : [];
+    })).filter(it => it.name);
     const summary = {
       unitId:         rec.unitId || null,
       unitName:       rec.unitName || '',
@@ -24864,9 +24889,11 @@ window.toggleInjuryPrintPreview = function(){
   }
   window.__readPublicChecklist = function(barcode){
     const db = fbDb();
-    if (!db || !window.firebaseRef || !window.firebaseGet) return Promise.resolve(null);
+    const key = encodeFbKey(barcode);
+    if (!db || !window.firebaseRef || !window.firebaseGet) return Promise.resolve(clMirrorGet(key));
     return window.firebaseGet(window.firebaseRef(db, 'publicChecklists/' + encodeFbKey(barcode)))
-      .then(s => s && s.exists() ? s.val() : null);
+      .then(s => s && s.exists() ? s.val() : clMirrorGet(key))
+      .catch(() => clMirrorGet(key));
   };
   // Upsert a single inspection record so it lands atomically even under concurrent writers.
   function fbUpsertRec(rec){
@@ -24924,7 +24951,7 @@ window.toggleInjuryPrintPreview = function(){
     if (!fbReady || !fbUser()) return;
     try {
       if (pendingUnits){
-        const list = pendingUnits;
+        const list = _clNormalizeUnitsList(pendingUnits);
         try { await fbSetWithFallback(FB_UNITS_PATH, list, 'units-flush'); pendingUnits = null; }
         catch(e){ fbWarn('units-flush', e); }
       }
@@ -24999,6 +25026,20 @@ window.toggleInjuryPrintPreview = function(){
           attachValue(fallbackPath, cb, scope + '-fallback');
         }
       });
+      // Some deployments allow reading the shared checklists/* path but only
+      // allow writing under users/<uid>/checklists/*. In that case there is no
+      // permission error, so attach the user fallback proactively or saved
+      // items/history from previous sessions will never be read back.
+      if (path.indexOf('checklists/') === 0) {
+        const base = fbUserBase();
+        if (base) {
+          const fallbackPath = base + '/' + path.slice('checklists/'.length);
+          if (!fbAttachedFallbacks.has(fallbackPath)) {
+            fbAttachedFallbacks.add(fallbackPath);
+            window.firebaseOnValue(window.firebaseRef(db, fallbackPath), cb, function(err){ fbWarn(scope + '-fallback-sub', err); });
+          }
+        }
+      }
     } catch(e){ fbWarn(scope + '-sub', e); }
   }
 
@@ -25047,7 +25088,7 @@ window.toggleInjuryPrintPreview = function(){
       // Validate: must be a non-empty array of objects, unique ids, unique barcodes, and every DEFAULT_UNITS id present.
       // Otherwise keep the existing local list to avoid a corrupt snapshot merging bad ids into the hub.
       let list = null;
-      try { list = Array.isArray(val) ? val : Object.values(val); } catch(_){ list = null; }
+      try { list = _clNormalizeUnitsList(val); } catch(_){ list = null; }
       if (!Array.isArray(list) || !list.length) return;
       const seenIds = new Set();
       const seenBcs = new Set();
@@ -25065,28 +25106,44 @@ window.toggleInjuryPrintPreview = function(){
       // Merge in any DEFAULT_UNITS that the remote list is missing (new checklists added by an update).
       const missingDefaults = DEFAULT_UNITS.filter(d => !seenIds.has(d.id) && !seenBcs.has(String(d.barcode).toLowerCase()));
       if (missingDefaults.length) {
-        list = list.concat(missingDefaults.map(d => JSON.parse(JSON.stringify(d))));
+        list = _clNormalizeUnitsList(list.concat(missingDefaults.map(d => JSON.parse(JSON.stringify(d)))));
         try { fbPushUnits(list); } catch(_){}
         console.info('[checklist-sync] merged '+missingDefaults.length+' new default checklist(s) into remote list');
       }
-      // Normalize items on read so item order is stable regardless of how
-      // Firebase serialized the array (array vs object with numeric keys).
-      list = _clNormalizeUnitsList(list);
       fbSuppress = true;
-      __unitsCache = list.slice();
+      __unitsCache = _clNormalizeUnitsList(list);
       __clUnitsReady = true;
       fbSuppress = false;
       try { window.__clScheduleDailyReminder && window.__clScheduleDailyReminder(); } catch(_){}
       refreshOpenViews();
     }, 'units');
 
-    // Legacy array-subscription intentionally disabled — the per-record path below is the single source of truth.
-    // (Previously subscribing here caused another unit's stale array to overwrite a fresh inspection.)
+    // Legacy array-subscription kept read-only for old records saved before
+    // inspections_by_id existed. We merge it into memory/backfill by id so it
+    // cannot overwrite newer per-record inspections.
+    attachValue(FB_RECS_PATH, (snap)=>{
+      const val = snap && snap.val();
+      const legacyArrRaw = __clNormalizeList(val);
+      if (!legacyArrRaw.length) return;
+      const _tombs = loadDeleted();
+      const legacyArr = [];
+      legacyArrRaw.forEach(raw => {
+        const r = normalizeInspectionRecord(raw);
+        if (!r || (r.id && Object.prototype.hasOwnProperty.call(_tombs, r.id))) return;
+        legacyArr.push(r);
+        try { if (r.id) fbSetWithFallback(FB_RECS_BY_ID + '/' + r.id, withAuthFields(r), 'rec-legacy-backfill').catch(()=>{}); } catch(_){}
+      });
+      if (!legacyArr.length) return;
+      fbSuppress = true;
+      __recsCache = sanitizeInspectionList(mergeRecs(loadRecs(), legacyArr));
+      fbSuppress = false;
+      refreshOpenViews();
+    }, 'recs-legacy');
 
     // Subscribe per-record path — this is the reliable multi-user channel.
     attachValue(FB_RECS_BY_ID, (snap)=>{
       const obj = (snap && snap.val()) || {};
-      const remoteArrRaw = Object.values(obj);
+      const remoteArrRaw = __clNormalizeList(obj);
       const local = loadRecs();
       const remoteArr = [];
       let dropped = 0;
@@ -26014,7 +26071,14 @@ window.toggleInjuryPrintPreview = function(){
   }
   function __clPublicSet(barcode, summary){
     if (!barcode || !summary) return;
-    __clPublicCache.set(String(barcode).toLowerCase(), summary);
+    const clean = Object.assign({}, summary);
+    clean.items = __clNormalizeList(clean.items).map(it => ({
+      name: String((it && it.name) || it || '').trim(),
+      ok: !!(it && it.ok),
+      checked: !!(it && (it.checked || it.ok || it.ok === false && it.checked)),
+      notes: String((it && it.notes) || '').trim()
+    })).filter(it => it.name);
+    __clPublicCache.set(String(barcode).toLowerCase(), clean);
   }
   function __clFetchPublic(barcode){
     try {
@@ -26330,7 +26394,7 @@ window.toggleInjuryPrintPreview = function(){
       nextMeta[k] = prevMeta[k] || now;
     });
     u.items = cleaned;
-    u.itemsOrder = cleaned.slice(); // explicit canonical order, survives Firebase array->object serialization
+    u.itemsOrder = cleaned.slice();
     u.itemsMeta = nextMeta;
     u.itemsUpdatedAt = now;
     saveUnits(units);
