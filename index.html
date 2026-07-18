@@ -25109,7 +25109,9 @@ window.toggleInjuryPrintPreview = function(){
   function statusOf(rec){
     if (!rec) return {cls:'cl-status-none', label:'Not inspected', icon:'fa-circle-question'};
     const ageDays = (Date.now() - rec.ts) / 86400000;
-    if (!rec.allPassed) return {cls:'cl-status-fail', label:'Has issues', icon:'fa-triangle-exclamation'};
+    // Defensive: legacy records may have items with checked:false but allPassed:true.
+    const anyUnchecked = Array.isArray(rec.items) && rec.items.some(x => x && x.checked === false);
+    if (!rec.allPassed || anyUnchecked) return {cls:'cl-status-fail', label:'Has issues', icon:'fa-triangle-exclamation'};
     if (ageDays > STALE_DAYS) return {cls:'cl-status-stale', label:'Re-inspection due', icon:'fa-clock'};
     return {cls:'cl-status-ok', label:'Pass', icon:'fa-circle-check'};
   }
@@ -25222,6 +25224,51 @@ window.toggleInjuryPrintPreview = function(){
     const nowMin = now.getHours()*60 + now.getMinutes();
     return nowMin >= (t.h*60 + t.m);
   }
+  // ==== Reminder sound (WebAudio; no external asset) ====
+  let __clAudioCtx = null;
+  let __clAudioUnlocked = false;
+  function __clUnlockAudio(){
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!__clAudioCtx) __clAudioCtx = new Ctx();
+      if (__clAudioCtx.state === 'suspended') __clAudioCtx.resume().catch(()=>{});
+      __clAudioUnlocked = true;
+    } catch(_){}
+  }
+  try {
+    const oneShot = () => { __clUnlockAudio(); window.removeEventListener('pointerdown', oneShot, true); window.removeEventListener('keydown', oneShot, true); window.removeEventListener('touchstart', oneShot, true); };
+    window.addEventListener('pointerdown', oneShot, true);
+    window.addEventListener('keydown', oneShot, true);
+    window.addEventListener('touchstart', oneShot, true);
+  } catch(_){}
+  window.__clPlayReminderSound = function(){
+    try { if (typeof window.playNotificationSound === 'function') { window.playNotificationSound(); return; } } catch(_){}
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!__clAudioCtx) __clAudioCtx = new Ctx();
+      if (__clAudioCtx.state === 'suspended') __clAudioCtx.resume().catch(()=>{});
+      const ctx = __clAudioCtx;
+      const beep = (freq, startAt, durMs) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = 'sine';
+        o.frequency.value = freq;
+        g.gain.value = 0.0001;
+        o.connect(g).connect(ctx.destination);
+        const t0 = ctx.currentTime + startAt;
+        const t1 = t0 + durMs/1000;
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.15, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t1);
+        o.start(t0); o.stop(t1 + 0.02);
+      };
+      beep(880, 0,    220);
+      beep(660, 0.28, 220);
+      beep(880, 0.56, 260);
+    } catch(_){}
+  };
   function __clRenderPendingBanner(){
     const modal = document.getElementById('checklistsModal');
     if (!modal) return;
@@ -25229,6 +25276,7 @@ window.toggleInjuryPrintPreview = function(){
     let banner = document.getElementById('clDailyReminderBanner');
     const pending = __clPendingUnitsToday();
     if (__clIsPastReminderTime(new Date()) && pending.length) {
+      const wasNew = !banner;
       if (!banner) {
         banner = document.createElement('div');
         banner.id = 'clDailyReminderBanner';
@@ -25237,6 +25285,7 @@ window.toggleInjuryPrintPreview = function(){
       }
       const names = pending.map(u => u.name).slice(0,6).join(' • ');
       banner.innerHTML = '<i class="fas fa-bell"></i> Daily reminder — تذكير يومي: ' + pending.length + ' checklist(s) pending today: ' + names + (pending.length>6?' …':'');
+      if (wasNew) { try { window.__clPlayReminderSound && window.__clPlayReminderSound(); } catch(_){} }
     } else if (banner) {
       banner.remove();
     }
@@ -25272,6 +25321,7 @@ window.toggleInjuryPrintPreview = function(){
       if (!notified) {
         try { if (typeof window.showToast === 'function') window.showToast(title + ' — ' + body, 'warning'); } catch(_){}
       }
+      try { window.__clPlayReminderSound && window.__clPlayReminderSound(); } catch(_){}
       if (!force) { try { localStorage.setItem(key,'1'); } catch(_){} }
       try { __clRenderPendingBanner(); } catch(_){}
       return { fired:true, notified, pending: pending.length };
@@ -25404,10 +25454,18 @@ window.toggleInjuryPrintPreview = function(){
     if (!tech){ alert('Please enter the specialist nurse name'); return; }
     const rows = document.querySelectorAll('#clItemsWrap .cl-form-item');
     const items = []; let allPassed = true; let anyChecked = false;
+    let firstUnmarked = null;
+    // First pass: clear prior unmarked highlight.
+    rows.forEach(row => { row.style.border = ''; row.style.background = ''; });
     rows.forEach((row,idx)=>{
       const passed = row.classList.contains('pass');
       const failed = row.classList.contains('fail');
       if (passed || failed) anyChecked = true;
+      if (!passed && !failed) {
+        if (!firstUnmarked) firstUnmarked = row;
+        row.style.border = '2px solid #dc2626';
+        row.style.background = '#fef2f2';
+      }
       if (!passed) allPassed = false;
       items.push({
         name: currentUnit.items[idx],
@@ -25416,6 +25474,11 @@ window.toggleInjuryPrintPreview = function(){
         notes: (row.querySelector('.cl-item-notes')?.value || '').trim()
       });
     });
+    if (firstUnmarked) {
+      try { firstUnmarked.scrollIntoView({ behavior:'smooth', block:'center' }); } catch(_){}
+      alert('يجب تحديد كل بند كـ Pass أو Fail قبل الحفظ\nPlease mark every item as Pass or Fail before saving.');
+      return;
+    }
     if (!anyChecked){ alert('Please mark at least one item'); return; }
     const authUser = fbUser();
     const rec = {
@@ -25652,7 +25715,7 @@ window.toggleInjuryPrintPreview = function(){
     const __fetchPub = () => (typeof __clFetchPublic === 'function')
       ? __clFetchPublic(unit.barcode) : Promise.resolve(null);
     let __routed = false;
-    const __go = () => { if (__routed) return; __routed = true; showChecklistRoleChoice(unit); };
+    const __go = () => { if (__routed) return; __routed = true; showChecklistRoleChoice(unit, true); };
     // FIX: allow up to 4s for the first read; if the public cache is still
     // empty (cold cache / slow first response), try once more with a short
     // fallback so the "inspected today" guard doesn't false-negative.
@@ -25711,7 +25774,8 @@ window.toggleInjuryPrintPreview = function(){
           <h2 style="margin:0;font-size:1.15rem;color:#0f172a;"><i class="fas fa-user-shield"></i> Select Role — اختر الصلاحية</h2>
           <button type="button" onclick="closeChecklistRoleChoice()" style="background:#f1f5f9;border:none;width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:16px;color:#475569;">&times;</button>
         </div>
-        <div id="clRoleChoiceUnit" style="font-size:.95rem;color:#475569;margin-bottom:16px;"></div>
+         <div id="clRoleChoiceUnit" style="font-size:.95rem;color:#475569;margin-bottom:12px;"></div>
+         <div id="clRoleHistoryBlock" style="margin-bottom:14px;"></div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
           <button type="button" id="clRoleInspectorBtn" style="padding:16px 12px;border:2px solid #0284c7;background:#e0f2fe;color:#0c4a6e;border-radius:12px;cursor:pointer;font-weight:700;display:flex;flex-direction:column;align-items:center;gap:8px;">
             <i class="fas fa-clipboard-check" style="font-size:1.8rem;"></i>
@@ -25757,8 +25821,64 @@ window.toggleInjuryPrintPreview = function(){
       openAuditorView(unit);
     }
   }
+  function __clBuildHistoryBlockHtml(unit){
+    const recs = loadRecs()
+      .filter(r => r && (r.unitId === unit.id || (r.barcode && unit.barcode && String(r.barcode).toLowerCase() === String(unit.barcode).toLowerCase())))
+      .sort((a,b)=>(b.ts||0)-(a.ts||0));
+    const pub = (typeof __clPublicGet === 'function') ? __clPublicGet(unit.barcode) : null;
+    let rows = recs.slice(0,10).map(r=>{
+      const total=(r.items||[]).length;
+      const passed=(r.items||[]).filter(x=>x&&x.ok).length;
+      const anyUnchecked=(r.items||[]).some(x=>x && x.checked===false);
+      const ok = r.allPassed && !anyUnchecked;
+      const badge = ok
+        ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Pass</span>'
+        : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Issues</span>';
+      return `<tr>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(_fmtDT(r.ts))}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(r.specialistNurse||'—')}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;font-size:.8rem;">${passed}/${total}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;">${badge}</td>
+      </tr>`;
+    });
+    if (!rows.length && pub && Number(pub.lastTs)) {
+      const items = pub.items || [];
+      const passed = items.filter(x=>x&&x.ok).length;
+      const badge = (pub.status==='pass')
+        ? '<span style="background:#dcfce7;color:#166534;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Pass</span>'
+        : '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;">Issues</span>';
+      rows = [`<tr>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(_fmtDT(pub.lastTs))}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-size:.8rem;">${_escHtml(pub.specialistNurse||'—')}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;font-size:.8rem;">${passed}/${items.length}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;">${badge}</td>
+      </tr>`];
+    }
+    const body = rows.length
+      ? `<div style="overflow-x:auto;max-height:220px;overflow-y:auto;">
+           <table style="width:100%;border-collapse:collapse;">
+             <thead><tr style="background:#e2e8f0;color:#0f172a;position:sticky;top:0;">
+               <th style="padding:6px 8px;text-align:left;font-size:.72rem;">Date · التاريخ</th>
+               <th style="padding:6px 8px;text-align:left;font-size:.72rem;">Inspector · الفاحص</th>
+               <th style="padding:6px 8px;text-align:center;font-size:.72rem;">Items</th>
+               <th style="padding:6px 8px;text-align:center;font-size:.72rem;">Result</th>
+             </tr></thead>
+             <tbody>${rows.join('')}</tbody>
+           </table>
+         </div>`
+      : `<div style="padding:12px;text-align:center;color:#94a3b8;font-size:.85rem;">No previous inspections yet · لا توجد فحوصات سابقة</div>`;
+    return `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-weight:700;color:#0f172a;font-size:.85rem;"><i class="fas fa-history"></i> Previous inspections — سجل الفحوصات السابقة</div>
+        <button type="button" onclick="(function(){try{closeChecklistRoleChoice();openAuditorView(${JSON.stringify(unit).replace(/</g,'\\u003c')});}catch(e){}})()" style="background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;padding:4px 10px;border-radius:6px;cursor:pointer;font-weight:600;font-size:.72rem;"><i class="fas fa-external-link-alt"></i> View full</button>
+      </div>
+      ${body}
+    </div>`;
+  }
   function showChecklistRoleChoice(unit, forcePrompt){
     // Fast path: if the user chose "Remember" previously, skip the modal.
+    // BUT never skip on a fresh scan (forcePrompt=true) so the user always
+    // sees the "Previous inspections" history for the scanned unit.
     if (!forcePrompt){
       const saved = __clGetSavedRole();
       if (saved === 'inspector' || saved === 'auditor'){
@@ -25769,6 +25889,19 @@ window.toggleInjuryPrintPreview = function(){
     const m = ensureRoleChoiceModal();
     document.getElementById('clRoleChoiceUnit').innerHTML =
       `<i class="fas ${unit.icon||'fa-cube'}" style="color:${unit.color||'#0284c7'};"></i> <b>${unit.name}</b> <span style="opacity:.7;">· ${unit.barcode}</span>`;
+    // Inject previous-inspections block for this unit.
+    try {
+      const hb = document.getElementById('clRoleHistoryBlock');
+      if (hb) hb.innerHTML = __clBuildHistoryBlockHtml(unit);
+      // Refresh from public summary so cross-device history shows up.
+      if (typeof __clFetchPublic === 'function') {
+        __clFetchPublic(unit.barcode).then(()=>{
+          const hb2 = document.getElementById('clRoleHistoryBlock');
+          const stillOpen = document.getElementById('clRoleChoiceModal')?.style.display === 'flex';
+          if (hb2 && stillOpen) hb2.innerHTML = __clBuildHistoryBlockHtml(unit);
+        }).catch(()=>{});
+      }
+    } catch(_){}
     const insBtn = document.getElementById('clRoleInspectorBtn');
     const audBtn = document.getElementById('clRoleAuditorBtn');
     const remember = document.getElementById('clRoleRemember');
