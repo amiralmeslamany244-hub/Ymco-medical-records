@@ -24748,10 +24748,39 @@ window.toggleInjuryPrintPreview = function(){
   // Public, minimal summary — safe for unauthenticated read.
   // Only last inspection date + specialist nurse name (plus unit identity + pass/fail flag).
   // Excludes items, notes, uid, and any sensitive detail.
+  // Local mirror so signed-out visits on the SAME device (and any device that
+  // has ever loaded the summary) still see the latest inspection even when the
+  // Firebase read is empty or blocked by rules.
+  const CL_LS_MIRROR_PREFIX = 'ymco_cl_pub_';
+  function clMirrorSet(key, summary){
+    try {
+      // Cap items so the localStorage entry stays small.
+      const trimmed = Object.assign({}, summary);
+      if (Array.isArray(trimmed.items) && trimmed.items.length > 60) {
+        trimmed.items = trimmed.items.slice(0, 60);
+      }
+      const json = JSON.stringify(trimmed);
+      if (json.length < 12000) localStorage.setItem(CL_LS_MIRROR_PREFIX + key, json);
+    } catch(_){}
+  }
+  function clMirrorGet(key){
+    try {
+      const raw = localStorage.getItem(CL_LS_MIRROR_PREFIX + key);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch(_){ return null; }
+  }
+  window.__clMirrorGet = clMirrorGet;
+
+  // Queue of publicChecklist writes that arrived before Firebase auth was ready.
+  const pendingPublic = [];
+  function flushPendingPublic(){
+    if (!pendingPublic.length) return;
+    const list = pendingPublic.splice(0);
+    list.forEach(rec => { try { fbUpsertPublicChecklist(rec); } catch(_){} });
+  }
   function fbUpsertPublicChecklist(rec){
     if (fbSuppress || !rec || !rec.barcode) return;
-    const db = fbDb();
-    if (!db || !window.firebaseRef || !window.firebaseSet) return;
     const key = encodeFbKey(rec.barcode);
     if (!key) return;
     const safeItems = Array.isArray(rec.items) ? rec.items.map(it => ({
@@ -24773,6 +24802,17 @@ window.toggleInjuryPrintPreview = function(){
       failedCount:    safeItems.filter(i => i.checked && !i.ok).length,
       updatedAt:      Date.now()
     };
+    // Always mirror locally first — this is what unblocks the "No previous
+    // inspections found" case on repeat visits from the same device.
+    clMirrorSet(key, summary);
+    const db = fbDb();
+    if (!db || !window.firebaseRef || !window.firebaseSet) return;
+    // If auth isn't ready, queue and retry after it settles so the write
+    // isn't silently dropped by security rules requiring auth.
+    if (!fbReady || !fbUser()) {
+      pendingPublic.push(rec);
+      return;
+    }
     window.firebaseSet(window.firebaseRef(db, 'publicChecklists/' + key), summary)
       .then(()=>{ console.info('[checklist-sync] wrote publicChecklists/' + key); })
       .catch(e=>{ fbWarn('publicChecklists', e); });
@@ -26196,6 +26236,7 @@ window.toggleInjuryPrintPreview = function(){
   (function backfillPublicSummaries(){
     function run(){
       try {
+        try { flushPendingPublic(); } catch(_){}
         const units = loadUnits();
         const recs = loadRecs();
         units.forEach(u => {
@@ -26209,6 +26250,19 @@ window.toggleInjuryPrintPreview = function(){
     // Wait a bit for Firebase auth to settle so writes succeed.
     setTimeout(run, 4000);
     setTimeout(run, 12000);
+    // Also poll for fbReady so we backfill as soon as auth completes — the
+    // 4s/12s timers are too late on slow connections and used to leave the
+    // publicChecklists/* branch empty on the very first inspector visit.
+    let tries = 0;
+    const readyTimer = setInterval(()=>{
+      tries++;
+      if (typeof fbReady !== 'undefined' && fbReady && (typeof fbUser === 'function') && fbUser()) {
+        clearInterval(readyTimer);
+        run();
+      } else if (tries > 60) {
+        clearInterval(readyTimer);
+      }
+    }, 500);
   })();
 
   // ===== Public read-only status view when URL has ?checklist=BARCODE =====
@@ -26486,6 +26540,16 @@ window.toggleInjuryPrintPreview = function(){
       return String(v == null ? '' : v).replace(/[.#$\[\]\/]/g, '_');
     }
 
+    // Local mirror keyed by encoded barcode — written by any signed-in
+    // inspector who saved an inspection on this device.
+    function readLocalMirror(){
+      try {
+        const raw = localStorage.getItem('ymco_cl_pub_' + encodePubKey(code));
+        if (!raw) return null;
+        return JSON.parse(raw);
+      } catch(_){ return null; }
+    }
+
     function renderFromPublicSummary(summary){
       // publicChecklists summary is read-only and contains only safe fields.
       const unit = {
@@ -26506,26 +26570,77 @@ window.toggleInjuryPrintPreview = function(){
       render(unit, latest.ts ? latest : null, isToday ? latest : null);
     }
 
+    // Render from a mirror summary but tell the viewer it may be stale.
+    function renderFromLocalMirror(summary){
+      renderFromPublicSummary(summary);
+      const note = document.querySelector('#pubClOverlay .pub-note');
+      if (note) note.textContent = 'Cached view from this device · قد لا يكون محدثاً';
+    }
+
+    // Try anonymous sign-in once, then retry the public summary read. If
+    // anonymous auth is disabled, this quietly resolves to null so the caller
+    // can fall through to the local mirror.
+    function tryAnonThenPublic(dbRef, pubKey){
+      return new Promise(resolve => {
+        try {
+          if (!firebase.auth || !firebase.auth().signInAnonymously) return resolve(null);
+          if (firebase.auth().currentUser) {
+            // Already signed in; the first read attempt failed for a real reason.
+            return resolve(null);
+          }
+          firebase.auth().signInAnonymously()
+            .then(()=> dbRef.ref('publicChecklists/' + pubKey).get())
+            .then(snap => resolve(snap && snap.exists() ? snap.val() : null))
+            .catch(()=> resolve(null));
+        } catch(_){ resolve(null); }
+      });
+    }
+
+    function renderNoDataYet(){
+      const badge = document.getElementById('pubClBadge');
+      const meta  = document.getElementById('pubClMeta');
+      const title = document.getElementById('pubClTitle');
+      const details = document.getElementById('pubClDetails');
+      if (title) title.textContent = 'Checklist';
+      badge.className = 'pub-badge wait';
+      badge.innerHTML = `
+        <div class="big"><i class="fas fa-clipboard-question"></i></div>
+        <div>No inspection data available</div>
+      `;
+      meta.style.display = '';
+      meta.innerHTML = '<div>Ask a signed-in inspector to log today\'s check.<br><span style="opacity:.75;">اطلب من الفاحص المسجَّل تسجيل فحص اليوم.</span></div>';
+      if (details){ details.style.display = 'none'; details.innerHTML = ''; }
+    }
+
     function tryFirebase(attempt){
       attempt = attempt || 0;
+      // If Firebase never becomes available, try the local mirror before giving up.
       if (typeof firebase === 'undefined' || !firebase.database){
         if (attempt < 40) return setTimeout(()=>tryFirebase(attempt+1), 150);
+        const mirror = readLocalMirror();
+        if (mirror){ renderFromLocalMirror(mirror); return; }
         if (!withLocalFallback()) renderError('Cannot reach the server. Please check your connection.');
         return;
       }
       let dbRef;
       try { dbRef = firebase.database(); } catch(e){
+        const mirror = readLocalMirror();
+        if (mirror){ renderFromLocalMirror(mirror); return; }
         if (!withLocalFallback()) renderError('Cannot connect to database.');
         return;
       }
 
       const pubKey = encodePubKey(code);
-      // 1) Try the public summary path first — readable without sign-in.
+      // 1) Try the public summary path first — readable without sign-in
+      //    (when Firebase rules allow it).
       dbRef.ref('publicChecklists/' + pubKey).get().then(snap => {
         if (snap && snap.exists()){
           const val = snap.val();
           if (val && (val.barcode || val.unitName)){
             renderFromPublicSummary(val);
+            // Refresh the local mirror so future signed-out visits from this
+            // device don't depend on the network again.
+            try { localStorage.setItem('ymco_cl_pub_' + pubKey, JSON.stringify(val)); } catch(_){}
             // For signed-in users, also try the protected paths to enrich the "Open form" button.
             const signedIn = (firebase.auth && firebase.auth().currentUser);
             if (signedIn){
@@ -26547,36 +26662,78 @@ window.toggleInjuryPrintPreview = function(){
             return;
           }
         }
-        // 2) No public summary. Fall back to protected paths (works only if signed in / rules allow).
-        Promise.all([
-          dbRef.ref('checklists/units').get().catch(()=>null),
-          dbRef.ref('checklists/inspections_by_id').get().catch(()=>null),
-          dbRef.ref('checklists/inspections').get().catch(()=>null),
-        ]).then(([uSnap, rSnap, rSnap2]) => {
-          const unitsVal = uSnap && uSnap.exists() ? uSnap.val() : null;
-          const recsVal  = (rSnap && rSnap.exists() ? rSnap.val() : null)
-                        || (rSnap2 && rSnap2.exists() ? rSnap2.val() : null);
-          if (!unitsVal){
-            if (!withLocalFallback()){
-              // No cloud data + no local data. Show a friendly "not inspected yet" state.
-              render({ name: 'Checklist', barcode: code, icon: 'fa-clipboard-check', color: '#334155' }, null, null);
-            }
+        // 2) No public summary. Try anonymous auth + re-read once — this
+        //    unblocks projects whose rules require an authenticated read.
+        tryAnonThenPublic(dbRef, pubKey).then(val => {
+          if (val && (val.barcode || val.unitName)){
+            renderFromPublicSummary(val);
+            try { localStorage.setItem('ymco_cl_pub_' + pubKey, JSON.stringify(val)); } catch(_){}
             return;
           }
-          const unit = findUnit(unitsVal);
-          if (!unit){ renderUnknown(); return; }
-          render(unit, pickLatest(recsVal, unit.id), findToday(recsVal, unit.id));
-        }).catch(err => {
-          console.warn('public checklist status read failed', err);
-          if (!withLocalFallback()){
-            render({ name: 'Checklist', barcode: code, icon: 'fa-clipboard-check', color: '#334155' }, null, null);
-          }
+          // 3) Fall back to protected paths (works only if signed in / rules allow).
+          Promise.all([
+            dbRef.ref('checklists/units').get().catch(()=>null),
+            dbRef.ref('checklists/inspections_by_id').get().catch(()=>null),
+            dbRef.ref('checklists/inspections').get().catch(()=>null),
+          ]).then(([uSnap, rSnap, rSnap2]) => {
+            const unitsVal = uSnap && uSnap.exists() ? uSnap.val() : null;
+            const recsVal  = (rSnap && rSnap.exists() ? rSnap.val() : null)
+                          || (rSnap2 && rSnap2.exists() ? rSnap2.val() : null);
+            const unit = unitsVal ? findUnit(unitsVal) : null;
+            const latest = (unit && recsVal) ? pickLatest(recsVal, unit.id) : null;
+            const today  = (unit && recsVal) ? findToday(recsVal, unit.id) : null;
+            if (unit && (latest || today)){
+              render(unit, latest, today);
+              return;
+            }
+            // 4) Last resort: local mirror.
+            const mirror = readLocalMirror();
+            if (mirror){ renderFromLocalMirror(mirror); return; }
+            // 5) Truly nothing. Show the neutral "no data" state instead of a
+            //    misleading red "Not inspected today" alarm.
+            if (unit) {
+              // We know which unit — reflect its identity, but keep the badge neutral.
+              const badge = document.getElementById('pubClBadge');
+              const title = document.getElementById('pubClTitle');
+              const icon  = document.getElementById('pubClIcon');
+              if (title) title.textContent = unit.name || 'Checklist';
+              if (unit.color && icon) icon.style.background = unit.color;
+              if (unit.icon && icon)  icon.innerHTML = `<i class="fas ${unit.icon}"></i>`;
+              if (badge) {
+                badge.className = 'pub-badge wait';
+                badge.innerHTML = `
+                  <div class="big"><i class="fas fa-clipboard-question"></i></div>
+                  <div>No inspection data available</div>
+                `;
+              }
+              const meta = document.getElementById('pubClMeta');
+              if (meta){
+                meta.style.display = '';
+                meta.innerHTML = '<div>Ask a signed-in inspector to log today\'s check.<br><span style="opacity:.75;">اطلب من الفاحص المسجَّل تسجيل فحص اليوم.</span></div>';
+              }
+            } else {
+              renderNoDataYet();
+            }
+          }).catch(err => {
+            console.warn('public checklist status read failed', err);
+            const mirror = readLocalMirror();
+            if (mirror){ renderFromLocalMirror(mirror); return; }
+            renderNoDataYet();
+          });
         });
       }).catch(err => {
         console.warn('publicChecklists read failed', err);
-        if (!withLocalFallback()){
-          render({ name: 'Checklist', barcode: code, icon: 'fa-clipboard-check', color: '#334155' }, null, null);
-        }
+        // Try anon auth + retry, then mirror.
+        tryAnonThenPublic(dbRef, pubKey).then(val => {
+          if (val && (val.barcode || val.unitName)){
+            renderFromPublicSummary(val);
+            try { localStorage.setItem('ymco_cl_pub_' + pubKey, JSON.stringify(val)); } catch(_){}
+            return;
+          }
+          const mirror = readLocalMirror();
+          if (mirror){ renderFromLocalMirror(mirror); return; }
+          renderNoDataYet();
+        });
       });
     }
 
