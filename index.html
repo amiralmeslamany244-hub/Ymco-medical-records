@@ -10753,6 +10753,8 @@ window.YMCO_showSplash = function(){
 
                 const card = document.createElement('div');
                 card.className = 'worker-card';
+                card.id = 'worker-card-' + worker.id;
+                card.setAttribute('data-worker-id', worker.id);
                 card.innerHTML = `
               <div class="card-header">
                 <div class="worker-avatar" style="--avatar-c1:${jobColors[0]};--avatar-c2:${jobColors[1]};" title="${worker.role}"><i class="fas ${jobIcon}"></i></div>
@@ -15899,15 +15901,27 @@ function viewIdPhotoFull() {
 
             function openWorkerFromNotif(workerId){
                 try {
+                    if(!workerId) return;
                     if(typeof showWorkers === 'function') showWorkers();
-                    setTimeout(() => {
-                        const card = document.querySelector(`[data-worker-id="${workerId}"], #worker-card-${workerId}`);
+                    const tryFocus = (attempt) => {
+                        const card = document.querySelector('[data-worker-id="' + workerId + '"]')
+                            || document.getElementById('worker-card-' + workerId);
                         if(card){
                             card.scrollIntoView({behavior:'smooth', block:'center'});
-                            card.style.transition = 'box-shadow .3s'; card.style.boxShadow = '0 0 0 3px #4f46e5';
-                            setTimeout(() => card.style.boxShadow = '', 2000);
+                            card.style.transition = 'box-shadow .35s, outline-color .35s';
+                            card.style.outline = '3px solid #4f46e5';
+                            card.style.outlineOffset = '4px';
+                            card.style.boxShadow = '0 0 0 6px rgba(79,70,229,.25)';
+                            setTimeout(() => {
+                                card.style.boxShadow = '';
+                                card.style.outline = '';
+                                card.style.outlineOffset = '';
+                            }, 2500);
+                        } else if(attempt < 8){
+                            setTimeout(() => tryFocus(attempt + 1), 250);
                         }
-                    }, 300);
+                    };
+                    setTimeout(() => tryFocus(0), 200);
                 } catch(e){ console.warn(e); }
             }
 
@@ -16031,13 +16045,21 @@ function viewIdPhotoFull() {
                 renderPanel();
             };
 
-            window.clearAllNotifs = function(){
+            window.clearAllNotifs = async function(){
                 if(!confirm('Clear all notifications?')) return;
                 const u = window.getCurrentUser && window.getCurrentUser();
-                if(!u || !window.firebaseDB) return;
-                window.firebaseDB.ref('notifications/' + u.uid).remove().catch(e => console.warn(e));
-                notifCache = {};
-                renderPanel();
+                if(!u || !window.firebaseDB){
+                    notifCache = {}; renderPanel(); return;
+                }
+                try {
+                    await window.firebaseDB.ref('notifications/' + u.uid).remove();
+                    notifCache = {};
+                    renderPanel();
+                } catch(e){
+                    console.error('clearAllNotifs failed:', e);
+                    if(typeof showNotification === 'function')
+                        showNotification('\u26a0\ufe0f Failed to clear notifications: ' + (e.message||e), 'error');
+                }
             };
 
             // ---- Write notifications for every other active user ----
@@ -16097,6 +16119,15 @@ function viewIdPhotoFull() {
                 // Firebase RTDB replays every existing child on first attach → satisfies the
                 // "notify user of past notifications when back online" requirement.
                 userNotifsRef.once('value', () => { initialSnapshotSeen = true; firstLoadDone = true; renderPanel(); });
+
+                userNotifsRef.on('child_removed', (snap) => {
+                    delete notifCache[snap.key];
+                    renderPanel();
+                });
+                userNotifsRef.on('child_changed', (snap) => {
+                    notifCache[snap.key] = snap.val() || {};
+                    renderPanel();
+                });
 
                 userNotifsRef.on('child_added', (snap) => {
                     const id = snap.key; const n = snap.val() || {};
