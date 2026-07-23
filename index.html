@@ -107,8 +107,6 @@
     <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
     <!-- Firebase for Medical Emergency Alerts (v10 compat) -->
-    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 
     <!-- Cloudinary direct upload (no widget needed) -->
     <style>
@@ -10619,6 +10617,7 @@ window.YMCO_showSplash = function(){
             waitForFirebase(30, function(firebaseReady) {
                 if (firebaseReady) {
                     const dbRef = window.firebaseRef(window.firebaseDB, 'medicalRecords');
+                    window.__medRecordsRef = dbRef; // track so we can detach on sign-out
                     window.firebaseGet(dbRef).then((snapshot) => {
                         if (snapshot.exists()) {
                             const data = snapshot.val();
@@ -10636,6 +10635,14 @@ window.YMCO_showSplash = function(){
                         }
                     }).catch((error) => {
                         console.error('Firebase get() error:', error);
+                        const code = (error && (error.code || error.message)) || '';
+                        if (/permission|denied|PERMISSION_DENIED/i.test(String(code))) {
+                            try {
+                                if (typeof showNotification === 'function') {
+                                    showNotification('تعذّر الاتصال بقاعدة البيانات — تأكد من تسجيل الدخول والصلاحيات (PERMISSION_DENIED).');
+                                }
+                            } catch (e) { /* ignore */ }
+                        }
                         loadFromLocalStorage();
                     });
                     window.firebaseOnValue(dbRef, (snapshot) => {
@@ -10665,12 +10672,15 @@ window.YMCO_showSplash = function(){
                                 refreshDashboard();
                             }
                         }
+                    }, (error) => {
+                        console.error('Firebase onValue error:', error);
                     });
                 } else {
                     loadFromLocalStorage();
                 }
             });
         }
+
 
         function generateInitialWorkers() {
             workers = [
@@ -16769,7 +16779,11 @@ function viewIdPhotoFull() {
         function init() {
             populateRoleDropdowns();
             populateNationalityDropdowns();
-            loadAllData();
+            // NOTE: loadAllData() is intentionally NOT called here.
+            // Realtime Database rules require auth != null, so we defer cloud
+            // reads until onAuthStateChanged confirms a signed-in active user.
+            // See onSignedInLoadCloud() below and the auth handler.
+            loadFromLocalStorage();
             initDarkMode();
             updateStatsAndRender();
             refreshDashboard();
@@ -16778,6 +16792,26 @@ function viewIdPhotoFull() {
             document.getElementById('filterRole').addEventListener('change', searchWorkers);
             document.getElementById('filterStatus').addEventListener('change', searchWorkers);
         }
+
+        // Called by the Firebase auth handler after a successful sign-in.
+        // Detaches any previous listener and re-attaches get() + onValue() so
+        // that the read carries the user's auth token and passes RTDB rules.
+        window.onSignedInLoadCloud = function onSignedInLoadCloud() {
+            try {
+                if (window.__medRecordsRef && window.firebaseDB) {
+                    window.__medRecordsRef.off();
+                }
+            } catch (e) { /* ignore */ }
+            window.__medRecordsRef = null;
+            loadAllData();
+        };
+
+        window.onSignedOutStopCloud = function onSignedOutStopCloud() {
+            try {
+                if (window.__medRecordsRef) window.__medRecordsRef.off();
+            } catch (e) { /* ignore */ }
+            window.__medRecordsRef = null;
+        };
 
         function populateRoleDropdowns() {
             const roleSelects = document.querySelectorAll('#workerRole, #filterRole');
@@ -20100,6 +20134,7 @@ window.toggleInjuryPrintPreview = function(){
     if(!user){
       currentUser = null; currentUserRole = null; currentUserStatus = null; currentUserPermissions = null;
       try { if(window.__stopUserNotifications) window.__stopUserNotifications(); } catch(e){}
+      try { if(window.onSignedOutStopCloud) window.onSignedOutStopCloud(); } catch(e){}
       lockUI();
 
       return;
@@ -20169,6 +20204,11 @@ window.toggleInjuryPrintPreview = function(){
     // ---------- Start per-user notifications inbox ----------
     try { if(window.__initUserNotifications) window.__initUserNotifications(user.uid); }
     catch(e){ console.warn('init user notifications failed', e); }
+
+    // Now that the user is authenticated, (re)load cloud data. RTDB rules
+    // require auth != null, so this must happen AFTER sign-in — not during init().
+    try { if(window.onSignedInLoadCloud) window.onSignedInLoadCloud(); }
+    catch(e){ console.warn('cloud data load failed', e); }
 
     // Show splash with nurse+worker image AFTER successful login
     if(typeof window.YMCO_showSplash === 'function') window.YMCO_showSplash();
