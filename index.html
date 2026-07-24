@@ -25699,20 +25699,33 @@ window.toggleInjuryPrintPreview = function(){
     const arr = Array.isArray(list) ? list : [];
     const clinicBagDefault = DEFAULT_UNITS.find(u => u && u.id === 'firstaid');
     if (!clinicBagDefault) return { list: arr, changed:false };
+    const ambulanceDefault = DEFAULT_UNITS.find(u => u && u.id === 'ambulance_bag');
+    const targetClinicItems = (ambulanceDefault && Array.isArray(ambulanceDefault.items))
+      ? ambulanceDefault.items.slice() : null;
     let changed = false;
-    // NOTE: Only enforce the display name + inspection period here. Items are
-    // user-editable via the "Edit items" UI (openChecklistManage) and must
-    // persist to Firebase, so we no longer force-reset items back to defaults.
+    // NOTE: Enforce display name + inspection period for known units, AND
+    // force-sync the Clinic Emergency Bag items to match the Ambulance
+    // Emergency Bag's 43-item list (one-time convergence for existing
+    // installs whose Firebase-stored list predates this change). Other
+    // units' items remain user-editable and persist to Firebase.
+    const itemsDiffer = (a, b) => {
+      if (!Array.isArray(a) || !Array.isArray(b)) return true;
+      if (a.length !== b.length) return true;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
+      return false;
+    };
     const next = arr.map(u => {
       if (!u) return u;
       const wantPeriod = Object.prototype.hasOwnProperty.call(__CL_UNIT_PERIODS, u.id) ? __CL_UNIT_PERIODS[u.id] : null;
       const nameFix = (u.id === 'firstaid' && u.name !== 'Clinic Emergency Bag');
       const periodFix = wantPeriod && u.period !== wantPeriod;
-      if (!nameFix && !periodFix) return u;
+      const itemsFix = (u.id === 'firstaid' && targetClinicItems && itemsDiffer(u.items, targetClinicItems));
+      if (!nameFix && !periodFix && !itemsFix) return u;
       changed = true;
       const patch = {};
       if (nameFix)   patch.name   = 'Clinic Emergency Bag';
       if (periodFix) patch.period = wantPeriod;
+      if (itemsFix)  patch.items  = targetClinicItems.slice();
       return Object.assign({}, u, patch);
     });
     return { list: next, changed };
